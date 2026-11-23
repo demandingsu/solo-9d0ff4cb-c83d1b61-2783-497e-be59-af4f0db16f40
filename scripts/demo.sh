@@ -36,3 +36,37 @@ curl -sS "$BASE/workstations/WS-01/spec"
 echo
 curl -sS "$BASE/workstations/WS-02/spec"
 echo
+
+echo; echo "== 6. 交错发布:A 只改主轴孔径 ITEM-DIA-40,核对的预览里也列出同一工位的定位孔径 ITEM-LEN-120 =="
+BATCH_A=$(curl -sS -X POST "$BASE/batches" -H 'Content-Type: application/json' -d '{
+  "title": "A-只改主轴孔径",
+  "ops": [
+    {"op": "upsert_item", "item_code": "ITEM-DIA-40", "name": "主轴孔直径", "nominal_um": 40000, "upper_um": 40004, "lower_um": 39996}
+  ]}')
+BID_A=$(echo "$BATCH_A" | python3 -c "import sys,json;print(json.load(sys.stdin)['id'])")
+echo "A verify(看 preview 里 WS-01 顺带列出的 ITEM-LEN-120):"
+curl -sS -X POST "$BASE/batches/$BID_A/verify"
+echo
+
+echo "B 先改定位孔径 ITEM-LEN-120 并发布:"
+BATCH_B=$(curl -sS -X POST "$BASE/batches" -H 'Content-Type: application/json' -d '{
+  "title": "B-改定位孔径",
+  "ops": [
+    {"op": "upsert_item", "item_code": "ITEM-LEN-120", "name": "轴肩长度", "nominal_um": 120000, "upper_um": 120010, "lower_um": 119992}
+  ]}')
+BID_B=$(echo "$BATCH_B" | python3 -c "import sys,json;print(json.load(sys.stdin)['id'])")
+curl -sS -X POST "$BASE/batches/$BID_B/verify" >/dev/null
+curl -sS -X POST "$BASE/batches/$BID_B/publish" >/dev/null
+
+echo "A 发布(期望 409 verification_stale:预览中的 ITEM-LEN-120 规范已变):"
+curl -sS -o /tmp/demo_a_publish.json -w 'HTTP %{http_code}\n' -X POST "$BASE/batches/$BID_A/publish"
+cat /tmp/demo_a_publish.json
+echo
+echo "A 退回后现行规范照常下发(WS-01):"
+curl -sS "$BASE/workstations/WS-01/spec"
+echo
+
+echo "A 重新核对后发布:"
+curl -sS -X POST "$BASE/batches/$BID_A/verify" >/dev/null
+curl -sS -X POST "$BASE/batches/$BID_A/publish"
+echo

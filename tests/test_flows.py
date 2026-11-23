@@ -294,10 +294,9 @@ def test_unrelated_change_does_not_block(client):
     assert client.get("/items/ITEM-SYM").json()["upper_um"] == 10006
 
 
-def test_publish_safety_net(client):
-    """交错场景:核对时合法、发布时才出现的违规,发布安全网兜底退回。"""
+def test_publish_safety_net(client, monkeypatch):
+    """安全网:即使指纹检查被绕过(模拟未预见的并发路径),发布复检仍拦下违规。"""
     setup_base(client)
-    # 新工位 WS-X 领用对称项目 ITEM-FLEX
     bid0 = make_batch(
         client,
         [upsert_item("ITEM-FLEX", 30000, 30005, 29995, "可变项目"),
@@ -315,7 +314,9 @@ def test_publish_safety_net(client):
     verify(client, bid_b)
     publish_ok(client, bid_b)
 
-    # A 的指纹未涉及 ITEM-FLEX,指纹仍新鲜,但发布安全网必须拦住
+    # 正常路径下 A 现在应因预览中项目规范变更被 409 打回(见下个用例);
+    # 这里绕过指纹检查,验证发布安全网仍能兜底。
+    monkeypatch.setattr("app.services.fingerprint_changes", lambda fingerprint, state: [])
     r = publish(client, bid_a)
     assert r.status_code == 422
     detail = r.json()["detail"]
@@ -326,6 +327,230 @@ def test_publish_safety_net(client):
     assert client.get(f"/batches/{bid_a}").json()["status"] == "rejected"
     # 生效状态未被破坏
     assert client.get("/workstations/WS-X").json()["terminal_generation"] == "new"
+
+
+def test_publish_safety_net_interleaved_preview_item(client):
+    """交错场景改为在指纹阶段拦截:预览所列项目的规范变更 → 409 退回待核对。"""
+    setup_base(client)
+    bid0 = make_batch(
+        client,
+        [upsert_item("ITEM-FLEX", 30000, 30005, 29995, "可变项目"),
+         upsert_ws("WS-X", "new", "试验工位"),
+         claim("WS-X", "ITEM-FLEX")],
+    )
+    verify(client, bid0)
+    publish_ok(client, bid0)
+
+    bid_a = make_batch(client, [upsert_ws("WS-X", "old", "试验工位")], "A-换代")
+    assert verify(client, bid_a)["status"] == "verified"
+    bid_b = make_batch(client, [upsert_item("ITEM-FLEX", 30000, 30008, 29996, "可变项目")], "B")
+    verify(client, bid_b)
+    publish_ok(client, bid_b)
+
+    r = publish(client, bid_a)
+    assert r.status_code == 409
+    assert r.json()["detail"]["error"] == "verification_stale"
+    assert client.get(f"/batches/{bid_a}").json()["status"] == "draft"
+    # 退回时现行规范仍照常下发(B 的规范),基础配置未被 A 破坏
+    assert client.get("/workstations/WS-X").json()["terminal_generation"] == "new"
+
+
+# ---------------------------------------------------------------- 预览范围失效规则
+
+
+def test_preview_lists_collateral_item_and_its_change_invalidates(client):
+    """只改主轴孔径,预览也会列出该工位的定位孔径;后者在别批改过 → 409 退回待核对。"""
+    setup_base(client)
+    # WS-NEW 同时领用主轴孔径 ITEM-SYM 与定位孔径 ITEM-ASYM(预览中顺带列出)
+    bid_a = make_batch(client, [upsert_item("ITEM-SYM", 10000, 10006, 9994, "主轴孔径")], "A-主轴孔径")
+    res = verify(client, bid_a)
+    assert res["status"] == "verified"
+    preview_ws = {p["workstation_code"]: p for p in res["preview"]}
+    assert "ITEM-ASYM" in {i["item_code"] for i in preview_ws["WS-NEW"]["items"]}
+
+    # 另一批先改定位孔径并发布
+    bid_b = make_batch(client, [upsert_item("ITEM-ASYM", 20000, 20009, 19991, "定位孔径")], "B-定位孔径")
+    verify(client, bid_b)
+    publish_ok(client, bid_b)
+
+    r = publish(client, bid_a)
+    assert r.status_code == 409
+    detail = r.json()["detail"]
+    assert detail["error"] == "verification_stale"
+    assert any("ITEM-ASYM" in c for c in detail["changed_entities"])
+    assert client.get(f"/batches/{bid_a}").json()["status"] == "draft"
+    # 退回时继续下发现行规范(B 的定位孔径已生效,A 的主轴孔径改动未落库)
+    spec = client.get("/workstations/WS-NEW/spec").json()
+    asym = next(i for i in spec["items"] if i["item_code"] == "ITEM-ASYM")
+    assert (asym["upper_um"], asym["lower_um"]) == (20009, 19991)
+    sym = next(i for i in spec["items"] if i["item_code"] == "ITEM-SYM")
+    assert (sym["upper_um"], sym["lower_um"]) == (10005, 9995)  # 仍是原值
+
+
+def test_preview_item_change_reverted_still_invalidates(client):
+    """预览所列项目的规范在别批改过又改回原样 → 版本计数器已变,仍须重新核对。"""
+    setup_base(client)
+    bid_a = make_batch(client, [upsert_item("ITEM-SYM", 10000, 10006, 9994, "主轴孔径")], "A")
+    assert verify(client, bid_a)["status"] == "verified"
+
+    for spec in ((20009, 19991), (20008, 19996)):  # 改掉再改回原样
+        bid = make_batch(client, [upsert_item("ITEM-ASYM", 20000, spec[0], spec[1], "定位孔径")])
+        verify(client, bid)
+        publish_ok(client, bid)
+    assert client.get("/items/ITEM-ASYM").json()["lower_um"] == 19996  # 内容已复原
+
+    r = publish(client, bid_a)
+    assert r.status_code == 409
+    assert r.json()["detail"]["error"] == "verification_stale"
+    assert client.get(f"/batches/{bid_a}").json()["status"] == "draft"
+    assert verify(client, bid_a)["status"] == "verified"
+    publish_ok(client, bid_a)
+
+
+def test_preview_workstation_config_change_invalidates(client):
+    """预览所列但批次未直接涉及的工位,其配置在别批变过 → 409。"""
+    setup_base(client)
+    # A 只改项目 ITEM-SYM;WS-OLD 因领用它而进入预览(不是 A 直接涉及的工位)
+    bid_a = make_batch(client, [upsert_item("ITEM-SYM", 10000, 10006, 9994, "主轴孔径")], "A")
+    assert verify(client, bid_a)["status"] == "verified"
+    assert "WS-OLD" in {p["workstation_code"] for p in verify(client, bid_a)["preview"]}
+    bid_b = make_batch(client, [upsert_ws("WS-OLD", "old", "二号车床改名")], "B-改工位")
+    verify(client, bid_b)
+    publish_ok(client, bid_b)
+
+    r = publish(client, bid_a)
+    assert r.status_code == 409
+    assert any("WS-OLD" in c for c in r.json()["detail"]["changed_entities"])
+    assert client.get(f"/batches/{bid_a}").json()["status"] == "draft"
+
+
+def test_preview_workstation_claim_list_change_invalidates(client):
+    """预览所列工位的领用清单在别批增删 → 409(即使之后改回)。"""
+    setup_base(client)
+    bid_more = make_batch(
+        client,
+        [upsert_item("ITEM-SYM2", 11000, 11005, 10995, "副孔径"),
+         claim("WS-OLD", "ITEM-SYM2")],
+        "基础补充",
+    )
+    verify(client, bid_more)
+    publish_ok(client, bid_more)
+
+    bid_a = make_batch(client, [upsert_item("ITEM-SYM", 10000, 10006, 9994, "主轴孔径")], "A")
+    assert verify(client, bid_a)["status"] == "verified"
+
+    bid_b = make_batch(client, [unclaim("WS-OLD", "ITEM-SYM2")], "B-取消领用")
+    verify(client, bid_b)
+    publish_ok(client, bid_b)
+    bid_c = make_batch(client, [claim("WS-OLD", "ITEM-SYM2")], "C-恢复领用")
+    verify(client, bid_c)
+    publish_ok(client, bid_c)
+
+    r = publish(client, bid_a)  # 领用清单已复原,但版本计数器已变
+    assert r.status_code == 409
+    assert r.json()["detail"]["error"] == "verification_stale"
+    assert client.get(f"/batches/{bid_a}").json()["status"] == "draft"
+
+
+def test_direct_item_claim_change_by_any_workstation_invalidates(client):
+    """批次直接涉及的项目,任何工位增删其领用都应退回。"""
+    setup_base(client)
+    # A 只直接改 ITEM-SYM;核对时 WS-EXT 尚不存在、也不在预览中
+    bid_a = make_batch(client, [upsert_item("ITEM-SYM", 10000, 10006, 9994, "主轴孔径")], "A")
+    assert verify(client, bid_a)["status"] == "verified"
+    assert "WS-EXT" not in {p["workstation_code"] for p in verify(client, bid_a)["preview"]}
+
+    # 核对后,预览外的 WS-EXT 领用了 A 直接涉及的项目 ITEM-SYM
+    bid_b = make_batch(
+        client, [upsert_ws("WS-EXT", "new", "外部工位"), claim("WS-EXT", "ITEM-SYM")], "B"
+    )
+    verify(client, bid_b)
+    publish_ok(client, bid_b)
+
+    r = publish(client, bid_a)
+    assert r.status_code == 409
+    assert any("ITEM-SYM" in c for c in r.json()["detail"]["changed_entities"])
+
+
+def test_preview_external_workstation_claim_of_listed_item_does_not_block(client):
+    """预览外的工位只增删顺带列出项目的领用,原批次仍可发布。"""
+    setup_base(client)
+    bid_a = make_batch(client, [upsert_item("ITEM-SYM", 10000, 10006, 9994, "主轴孔径")], "A")
+    assert verify(client, bid_a)["status"] == "verified"
+    # 确认 ITEM-ASYM 只在预览中顺带列出,WS-EXT 尚不存在、也不在预览
+    involved = client.get(f"/batches/{bid_a}").json()["involved"]
+    assert "ITEM-ASYM" in involved["preview_items"]
+    assert "WS-EXT" not in involved["workstations"]
+
+    # 核对之后才出现的预览外工位,只领用顺带列出的 ITEM-ASYM
+    bid_b = make_batch(
+        client, [upsert_ws("WS-EXT", "new", "外部工位"), claim("WS-EXT", "ITEM-ASYM")], "B-外部领用"
+    )
+    verify(client, bid_b)
+    publish_ok(client, bid_b)
+
+    publish_ok(client, bid_a)  # 预览外工位只动了顺带项目的领用 → 不受影响
+
+    # 反向:同一外部工位取消该领用,也不影响后续核对
+    bid_c = make_batch(client, [upsert_item("ITEM-SYM", 10000, 10007, 9993, "主轴孔径")], "C")
+    assert verify(client, bid_c)["status"] == "verified"
+    bid_d = make_batch(client, [unclaim("WS-EXT", "ITEM-ASYM")], "D-外部取消")
+    verify(client, bid_d)
+    publish_ok(client, bid_d)
+    publish_ok(client, bid_c)
+
+
+def test_preview_scope_includes_new_claim_of_preview_workstation(client):
+    """预览中所列工位的领用清单在核对后增删 → 原批次退回待核对。"""
+    setup_base(client)
+    bid_a = make_batch(
+        client, [upsert_item("ITEM-SYM", 10000, 10006, 9994, "主轴孔径")], "A"
+    )
+    res_a = verify(client, bid_a)
+    assert res_a["status"] == "verified"
+
+    # B 给预览工位 WS-OLD 新增领用(对称项目,旧终端可接受)
+    bid_b = make_batch(
+        client,
+        [upsert_item("ITEM-SYM2", 11000, 11005, 10995, "副孔径"), claim("WS-OLD", "ITEM-SYM2")],
+        "B-新增领用",
+    )
+    verify(client, bid_b)
+    publish_ok(client, bid_b)
+    r = publish(client, bid_a)
+    assert r.status_code == 409  # WS-OLD 在 A 的预览中,其领用清单变了
+    assert any("WS-OLD" in c for c in r.json()["detail"]["changed_entities"])
+    assert client.get(f"/batches/{bid_a}").json()["status"] == "draft"
+
+
+# ---------------------------------------------------------------- 升级兼容
+
+
+def test_legacy_verified_fingerprint_requires_reverify(client):
+    """升级前已核对未发布的批次(旧指纹格式)→ 发布 409,需重新核对。"""
+    from app.db import SessionLocal
+    from app.models import Batch
+
+    setup_base(client)
+    bid = make_batch(client, [upsert_item("ITEM-SYM", 10000, 10006, 9994, "主轴孔径")])
+    assert verify(client, bid)["status"] == "verified"
+
+    # 模拟升级前留下的指纹:没有 schema 版本号
+    with SessionLocal() as s:
+        b = s.get(Batch, bid)
+        b.fingerprint = {
+            "items": {"ITEM-SYM": {"version": 1, "claims_version": 1}},
+            "workstations": {"WS-NEW": {"version": 1, "claims_version": 1}},
+        }
+        s.commit()
+
+    r = publish(client, bid)
+    assert r.status_code == 409
+    assert r.json()["detail"]["error"] == "verification_stale"
+    assert client.get(f"/batches/{bid}").json()["status"] == "draft"
+
+    assert verify(client, bid)["status"] == "verified"
+    publish_ok(client, bid)
 
 
 # ---------------------------------------------------------------- 其他规则

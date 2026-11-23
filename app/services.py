@@ -180,7 +180,7 @@ def find_violations(state: State) -> list[dict]:
 
 
 def involved_entities(ops: list[dict]) -> tuple[set[str], set[str]]:
-    """批次所涉的检验项目与工位。"""
+    """批次直接涉及的检验项目与工位。"""
     item_codes: set[str] = set()
     ws_codes: set[str] = set()
     for op in ops:
@@ -195,47 +195,114 @@ def involved_entities(ops: list[dict]) -> tuple[set[str], set[str]]:
     return item_codes, ws_codes
 
 
-def build_fingerprint(ops: list[dict], state: State) -> dict:
-    """核对时记录所涉实体的版本快照;实体尚不存在记为 None。"""
+def preview_scope(sim: State, ops: list[dict]) -> tuple[set[str], set[str]]:
+    """核对预览覆盖的范围:(预览所列工位, 预览中列出的项目)。
+
+    预览工位 = 批次直接涉及的工位 + 改完后领用了批次直接涉及项目的工位;
+    预览项目 = 这些工位改完后领用的全部项目(含顺带列出的项目)。
+    """
     item_codes, ws_codes = involved_entities(ops)
+    affected_ws = set(ws_codes)
+    for ws_code, item_code in sim.claims:
+        if item_code in item_codes:
+            affected_ws.add(ws_code)
+    listed_items = {item_code for ws_code, item_code in sim.claims if ws_code in affected_ws}
+    return affected_ws, listed_items
+
+
+# 指纹格式版本。v2 起覆盖「核对预览」全部内容;升级前(v1/缺失)的核对一律失效。
+FINGERPRINT_SCHEMA = 2
+
+
+def build_fingerprint(ops: list[dict], state: State, sim: State) -> dict:
+    """核对时记录预览范围内实体的版本快照;实体尚不存在记为 None。
+
+    - items:          批次直接涉及的项目 -> 规范版本 + 领用版本(任何工位增删其领用均失效)
+    - preview_items:  预览中顺带列出的项目 -> 仅规范版本(预览外工位增删其领用不影响)
+    - workstations:   预览所列工位     -> 配置版本 + 领用清单版本
+    """
+    direct_items, _ = involved_entities(ops)
+    affected_ws, listed_items = preview_scope(sim, ops)
+
     fp_items = {}
-    for code in sorted(item_codes):
+    for code in sorted(direct_items):
         it = state.items.get(code)
         fp_items[code] = (
             None if it is None else {"version": it.version, "claims_version": it.claims_version}
         )
+    fp_preview_items = {}
+    for code in sorted(listed_items):
+        it = state.items.get(code)
+        fp_preview_items[code] = None if it is None else {"version": it.version}
     fp_ws = {}
-    for code in sorted(ws_codes):
+    for code in sorted(affected_ws):
         ws = state.workstations.get(code)
         fp_ws[code] = (
             None if ws is None else {"version": ws.version, "claims_version": ws.claims_version}
         )
-    return {"items": fp_items, "workstations": fp_ws}
+    return {
+        "schema": FINGERPRINT_SCHEMA,
+        "items": fp_items,
+        "preview_items": fp_preview_items,
+        "workstations": fp_ws,
+    }
 
 
 def fingerprint_changes(fingerprint: dict, state: State) -> list[str]:
-    """核对之后,所涉规范/工位配置/领用是否变过(版本号为单调计数器,改回原样也算变过)。"""
+    """核对之后,预览范围内的规范/工位配置/领用是否变过。
+
+    版本号为单调计数器,改回原样也算变过。旧格式(升级前核对)一律视为失效,
+    必须重新核对后才能发布。
+    """
+    if not isinstance(fingerprint, dict) or fingerprint.get("schema") != FINGERPRINT_SCHEMA:
+        return ["批次核对指纹缺失或为升级前旧格式,需重新核对"]
+
     changes: list[str] = []
-    for code, snap in (fingerprint or {}).get("items", {}).items():
-        cur = state.items.get(code)
-        cur_snap = None if cur is None else {"version": cur.version, "claims_version": cur.claims_version}
-        if cur_snap != snap:
+
+    def _item_snap(it) -> dict | None:
+        return None if it is None else {"version": it.version, "claims_version": it.claims_version}
+
+    def _ws_snap(ws) -> dict | None:
+        return None if ws is None else {"version": ws.version, "claims_version": ws.claims_version}
+
+    for code, snap in fingerprint.get("items", {}).items():
+        cur = _item_snap(state.items.get(code))
+        if cur == snap:
+            continue
+        if snap is None or cur is None:
             changes.append(f"检验项目 {code}:规范或领用已变更")
-    for code, snap in (fingerprint or {}).get("workstations", {}).items():
-        cur = state.workstations.get(code)
-        cur_snap = None if cur is None else {"version": cur.version, "claims_version": cur.claims_version}
+        else:
+            if snap.get("version") != cur.get("version"):
+                changes.append(f"检验项目 {code}:规范已变更")
+            if snap.get("claims_version") != cur.get("claims_version"):
+                changes.append(f"检验项目 {code}:领用关系已变更")
+
+    direct_items = set(fingerprint.get("items", {}))
+    for code, snap in fingerprint.get("preview_items", {}).items():
+        if code in direct_items:  # 已按批次直接涉及项目校验(更严格)
+            continue
+        cur = state.items.get(code)
+        cur_snap = None if cur is None else {"version": cur.version}
         if cur_snap != snap:
+            changes.append(f"检验项目 {code}:核对预览中的规范已变更")
+
+    for code, snap in fingerprint.get("workstations", {}).items():
+        cur = _ws_snap(state.workstations.get(code))
+        if cur == snap:
+            continue
+        if snap is None or cur is None:
             changes.append(f"工位 {code}:配置或领用已变更")
+        else:
+            if snap.get("version") != cur.get("version"):
+                changes.append(f"工位 {code}:配置已变更")
+            if snap.get("claims_version") != cur.get("claims_version"):
+                changes.append(f"工位 {code}:领用清单已变更")
     return changes
 
 
 def build_preview(sim: State, ops: list[dict]) -> list[dict]:
-    """核对预览:相关工位(批次涉及的 + 领用了所涉项目的)改完后将领用的规范。"""
-    item_codes, ws_codes = involved_entities(ops)
-    affected = set(ws_codes)
-    for ws_code, item_code in sim.claims:
-        if item_code in item_codes:
-            affected.add(ws_code)
+    """核对预览:相关工位改完后将领用的规范(含顺带列出的项目)。"""
+    affected, _ = preview_scope(sim, ops)
     preview = []
     for ws_code in sorted(affected):
         ws = sim.workstations.get(ws_code)
@@ -358,6 +425,7 @@ def batch_to_out(batch: Batch) -> dict:
     if batch.fingerprint:
         involved = {
             "items": sorted(batch.fingerprint.get("items", {}).keys()),
+            "preview_items": sorted(batch.fingerprint.get("preview_items", {}).keys()),
             "workstations": sorted(batch.fingerprint.get("workstations", {}).keys()),
         }
     return {

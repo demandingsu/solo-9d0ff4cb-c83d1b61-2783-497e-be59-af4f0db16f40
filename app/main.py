@@ -140,7 +140,7 @@ def verify_batch(batch_id: int, session: Session = Depends(get_session)):
     """核对:模拟应用整批,检查相关工位将领用的规范。
 
     若改完后仍有旧终端领用非对称公差,列出工位和项目,整批退回(rejected);
-    否则记录所涉实体版本指纹,批次进入 verified。
+    否则记录「核对预览」范围内全部实体的版本指纹,批次进入 verified。
     """
     with services.STATE_LOCK:
         batch = _get_batch(session, batch_id)
@@ -162,7 +162,7 @@ def verify_batch(batch_id: int, session: Session = Depends(get_session)):
         else:
             batch.status = "verified"
             batch.violations = None
-            batch.fingerprint = services.build_fingerprint(ops, state)
+            batch.fingerprint = services.build_fingerprint(ops, state, sim)
         session.commit()
         return {
             "batch_id": batch.id,
@@ -175,7 +175,7 @@ def verify_batch(batch_id: int, session: Session = Depends(get_session)):
 
 @app.post("/batches/{batch_id}/publish", response_model=schemas.PublishResponse, tags=["批次"])
 def publish_batch(batch_id: int, session: Session = Depends(get_session)):
-    """发布:要求批次已核对且核对后所涉实体未变(无关改动不影响发布)。
+    """发布:要求批次已核对且核对后预览范围内实体未变(无关改动不影响发布)。
 
     发布时事务性落库并联动换版;生效状态永远满足「旧终端不领用非对称公差」。
     """
@@ -191,7 +191,7 @@ def publish_batch(batch_id: int, session: Session = Depends(get_session)):
         state = services.load_state(session)
         changed = services.fingerprint_changes(batch.fingerprint or {}, state)
         if changed:
-            # 核对后所涉实体变过(即使改回原样):核对失效,打回 draft
+            # 核对后预览范围内实体变过(即使改回原样):核对失效,打回 draft
             batch.status = "draft"
             batch.fingerprint = None
             batch.verified_at = None
