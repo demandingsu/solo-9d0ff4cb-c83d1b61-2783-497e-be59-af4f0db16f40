@@ -1,0 +1,14 @@
+services:
+  api:
+    build: .
+    image: gauge-spec-api:latest
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: sqlite:////data/specs.db
+    volumes:
+      - gauge_data:/data
+    restart: unless-stopped
+
+volumes:
+  gauge_data:
